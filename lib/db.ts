@@ -25,21 +25,25 @@ export const isSupabaseRestConfigured = Boolean(
 
 export const isDbConfigured = isPostgresConfigured || isSupabaseRestConfigured;
 
-// ─── Connection Pool for PostgreSQL (Singleton in dev) ───────────────────────
+// ─── Connection Pool for PostgreSQL (Only initialize if Postgres is explicitly needed)
 declare global {
   // eslint-disable-next-line no-var
   var pgPool: Pool | undefined;
 }
 
+// Check if PostgreSQL URL is valid and NOT an IPv6-only Supabase direct host when REST is ready
+const isIpv6DirectSupabase =
+  rawDatabaseUrl.includes("db.") && rawDatabaseUrl.includes(".supabase.co");
+
 let pool: Pool | null = null;
-if (isPostgresConfigured) {
+if (isPostgresConfigured && (!isIpv6DirectSupabase || !isSupabaseRestConfigured)) {
   if (!globalThis.pgPool) {
     globalThis.pgPool = new Pool({
       connectionString: rawDatabaseUrl,
-      ssl: rawDatabaseUrl.includes("supabase.co") ? { rejectUnauthorized: false } : undefined,
+      ssl: rawDatabaseUrl.includes("supabase") ? { rejectUnauthorized: false } : undefined,
       max: 10,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      connectionTimeoutMillis: 5000,
     });
   }
   pool = globalThis.pgPool;
@@ -91,29 +95,8 @@ export async function insertTemperatureReading(
   const hrVal = heartRate != null && !isNaN(heartRate) && heartRate > 0 ? Math.round(heartRate) : null;
   const spo2Val = spo2 != null && !isNaN(spo2) && spo2 > 0 ? Math.round(spo2) : null;
 
-  if (isPostgresConfigured && pool) {
-    try {
-      await ensureTable();
-      const result = await pool.query(
-        `INSERT INTO public.temperature_readings (temperature, heart_rate, spo2, created_at)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, temperature, heart_rate, spo2, created_at`,
-        [temp, hrVal, spo2Val, timestamp]
-      );
-      if (result.rows.length > 0) {
-        const row = result.rows[0];
-        return {
-          id: row.id,
-          temperature: Number(row.temperature),
-          heart_rate: row.heart_rate != null ? Number(row.heart_rate) : null,
-          spo2: row.spo2 != null ? Number(row.spo2) : null,
-          created_at: new Date(row.created_at).toISOString(),
-        };
-      }
-    } catch (pgErr) {
-      console.error("[DB] PostgreSQL insert error:", pgErr);
-    }
-  } else if (isSupabaseRestConfigured && supabaseClient) {
+  // 1. Primary: Fast, non-blocking Supabase REST Client (IPv4 & Serverless friendly)
+  if (isSupabaseRestConfigured && supabaseClient) {
     try {
       const { data, error } = await supabaseClient
         .from("temperature_readings")
@@ -142,10 +125,61 @@ export async function insertTemperatureReading(
     }
   }
 
+  // 2. Secondary fallback: Direct PostgreSQL connection
+  if (isPostgresConfigured && pool) {
+    try {
+      await ensureTable();
+      const result = await pool.query(
+        `INSERT INTO public.temperature_readings (temperature, heart_rate, spo2, created_at)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, temperature, heart_rate, spo2, created_at`,
+        [temp, hrVal, spo2Val, timestamp]
+      );
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        return {
+          id: row.id,
+          temperature: Number(row.temperature),
+          heart_rate: row.heart_rate != null ? Number(row.heart_rate) : null,
+          spo2: row.spo2 != null ? Number(row.spo2) : null,
+          created_at: new Date(row.created_at).toISOString(),
+        };
+      }
+    } catch (pgErr) {
+      console.error("[DB] PostgreSQL insert error:", pgErr);
+    }
+  }
+
   return null;
 }
 
 export async function getTemperatureReadings(limit: number): Promise<DbTempRecord[] | null> {
+  // 1. Primary: Fast, non-blocking Supabase REST Client (IPv4 & Serverless friendly)
+  if (isSupabaseRestConfigured && supabaseClient) {
+    try {
+      const { data, error } = await supabaseClient
+        .from("temperature_readings")
+        .select("id, temperature, heart_rate, spo2, created_at")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (!error && data) {
+        return data.map((item) => ({
+          id: item.id,
+          temperature: Number(item.temperature),
+          heart_rate: item.heart_rate != null ? Number(item.heart_rate) : null,
+          spo2: item.spo2 != null ? Number(item.spo2) : null,
+          created_at: item.created_at,
+        }));
+      }
+      if (error) {
+        console.warn("[DB] Supabase REST fetch error:", error.message);
+      }
+    } catch (sbErr) {
+      console.error("[DB] Supabase REST error:", sbErr);
+    }
+  }
+
+  // 2. Secondary fallback: Direct PostgreSQL connection
   if (isPostgresConfigured && pool) {
     try {
       await ensureTable();
@@ -165,27 +199,6 @@ export async function getTemperatureReadings(limit: number): Promise<DbTempRecor
       }));
     } catch (pgErr) {
       console.error("[DB] PostgreSQL fetch error:", pgErr);
-      return null;
-    }
-  } else if (isSupabaseRestConfigured && supabaseClient) {
-    try {
-      const { data, error } = await supabaseClient
-        .from("temperature_readings")
-        .select("id, temperature, heart_rate, spo2, created_at")
-        .order("created_at", { ascending: false })
-        .limit(limit);
-      if (!error && data) {
-        return data.map((item) => ({
-          id: item.id,
-          temperature: Number(item.temperature),
-          heart_rate: item.heart_rate != null ? Number(item.heart_rate) : null,
-          spo2: item.spo2 != null ? Number(item.spo2) : null,
-          created_at: item.created_at,
-        }));
-      }
-    } catch (sbErr) {
-      console.error("[DB] Supabase REST error:", sbErr);
-      return null;
     }
   }
 

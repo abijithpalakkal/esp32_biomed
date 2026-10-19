@@ -27,7 +27,7 @@
 // ─── Wi-Fi & Endpoint Configuration ──────────────────────────────────────────
 const char* ssid     = "Abijith24";
 const char* password = "9847102363";
-const char* url      = "http://192.168.29.176:3000/api/temperature";
+const char* url      = "https://esp32-biomed.vercel.app/api/temperature";
 
 const unsigned long SEND_INTERVAL_MS = 4000;   // Send readings every 4 seconds
 const unsigned long RECONNECT_INTERVAL_MS = 10000; // Wi-Fi reconnect retry interval
